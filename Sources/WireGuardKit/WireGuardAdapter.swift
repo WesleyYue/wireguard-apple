@@ -68,6 +68,8 @@ public struct WireGuardAdapterDiagnostics: Sendable {
     public fileprivate(set) var icmpGeneration: UInt64?
     public fileprivate(set) var icmpOpened: UInt64 = 0
     public fileprivate(set) var icmpClosed: UInt64 = 0
+    public fileprivate(set) var icmpOpenErrors: UInt64 = 0
+    public fileprivate(set) var icmpCloseErrors: UInt64 = 0
     public fileprivate(set) var icmpSendErrors: UInt64 = 0
     public fileprivate(set) var icmpReadErrors: UInt64 = 0
     public fileprivate(set) var icmpCanceledReads: UInt64 = 0
@@ -819,6 +821,7 @@ extension WireGuardAdapter: ICMPPingProvider {
         let addrString = "\(address)"
         let socket = wgOpenInTunnelICMP(tunnelHandle, addrString)
         if socket < 0 {
+            diagnostics.icmpOpenErrors += 1
             switch socket {
             case -19: // errNoSuchTunnel
                 throw WireGuardAdapterError.noSuchTunnel
@@ -840,7 +843,9 @@ extension WireGuardAdapter: ICMPPingProvider {
         // Forget the resource unconditionally, including while temporarily shut down.
         icmpSocket = nil
         diagnostics.icmpGeneration = nil
-        wgCloseInTunnelICMP(socket.tunnelHandle, socket.socketHandle)
+        if !wgCloseInTunnelICMP(socket.tunnelHandle, socket.socketHandle) {
+            diagnostics.icmpCloseErrors += 1
+        }
         diagnostics.icmpClosed += 1
     }
 
