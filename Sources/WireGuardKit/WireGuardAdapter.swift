@@ -586,8 +586,9 @@ public class WireGuardAdapter: @unchecked Sendable {
         // The handler runs on `workQueue`.
         networkMonitor?.cancel()
         monitorPath = nil
-        // Observe the physical route; the tunnel's utun route must not trigger its own socket rebind.
-        let monitor = NWPathMonitor(prohibitedInterfaceTypes: [.other, .loopback])
+        // Keep VPN routes usable. Prohibiting .other makes this monitor unsatisfied under an active tunnel.
+        // PathSignature selects the first physical interface from the path's preference order instead.
+        let monitor = NWPathMonitor()
         monitor.pathUpdateHandler = { [weak self] path in
             guard let self = self, self.pathObservationGeneration == generation else { return }
             self.diagnostics.pathUpdates += 1
