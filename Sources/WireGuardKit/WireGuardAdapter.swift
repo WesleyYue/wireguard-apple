@@ -81,14 +81,14 @@ public struct WireGuardAdapterDiagnostics: Sendable {
 }
 
 /// A socket belongs to exactly one backend generation, even if an integer handle is later reused.
-private struct ICMPSocket {
+private struct ICMPSocket: Sendable {
     let tunnelHandle: Int32
     let socketHandle: Int32
     let generation: UInt64
     let pingId: UInt16
 }
 
-public class WireGuardAdapter {
+public class WireGuardAdapter: @unchecked Sendable {
     public typealias LogHandler = (WireGuardLogLevel, String) -> Void
 
     /// Network routes monitor.
@@ -777,20 +777,27 @@ private func interfaceAddresses(of interface: String) -> Set<String> {
     return addresses
 }
 
+/// A receiver bound to one immutable socket identity. Cancellation never affects a replacement socket.
+public struct ICMPReceiveSession: Sendable {
+    private let receiveOperation: @Sendable () throws -> Int32
+    private let cancelOperation: @Sendable () -> Void
+
+    public init(receive: @escaping @Sendable () throws -> Int32, cancel: @escaping @Sendable () -> Void) {
+        receiveOperation = receive
+        cancelOperation = cancel
+    }
+
+    public func receive() throws -> Int32 { try receiveOperation() }
+    public func cancel() { cancelOperation() }
+}
+
 // A protocol encompassing the stateful ICMP ping capabilities of the WireGuardAdapter, decoupling them from its implementation
 public protocol ICMPPingProvider {
     func sendICMPPing(seqNumber: UInt16) throws
-    func receiveICMP() throws -> Int32
-
-    /// Closes the socket to end an outstanding receive. The next ping operation reopens it.
-    func cancelICMPReceive()
+    func makeICMPReceiveSession() throws -> ICMPReceiveSession
 }
 
 extension WireGuardAdapter: ICMPPingProvider {
-    public func cancelICMPReceive() {
-        workQueue.async { self.closeICMP() }
-    }
-
     /// Serialized acquisition includes ping identity and generation, so restart cannot mix their owners.
     private func acquireICMPSocket() throws -> ICMPSocket {
         dispatchPrecondition(condition: .onQueue(workQueue))
@@ -851,23 +858,38 @@ extension WireGuardAdapter: ICMPPingProvider {
 
     // Returns the sequence number of the ICMP message that was received.
     // This could be improved by also returning the ID of the message that was received.
-    public func receiveICMP() throws -> Int32 {
+    public func makeICMPReceiveSession() throws -> ICMPReceiveSession {
         dispatchPrecondition(condition: .notOnQueue(workQueue))
         let socket = try workQueue.sync { try self.acquireICMPSocket() }
-        let result = wgRecvInTunnelPing(socket.tunnelHandle, socket.socketHandle)
-        if result < 0 {
-            workQueue.async {
-                if self.icmpSocket?.generation == socket.generation,
-                   self.icmpSocket?.socketHandle == socket.socketHandle {
-                    self.diagnostics.icmpReadErrors += 1
-                } else {
-                    self.diagnostics.icmpCanceledReads += 1
+        return ICMPReceiveSession(
+            receive: { [weak self] in
+                // Resource identities never reuse handles. Even a read delayed until after stop/start can only
+                // target this session's original socket, never dynamically acquire the replacement.
+                let result = wgRecvInTunnelPing(socket.tunnelHandle, socket.socketHandle)
+                if result < 0 {
+                    self?.workQueue.async { [weak self] in
+                        guard let self else { return }
+                        if self.icmpSocket?.generation == socket.generation,
+                           self.icmpSocket?.socketHandle == socket.socketHandle,
+                           self.icmpSocket?.tunnelHandle == socket.tunnelHandle {
+                            self.diagnostics.icmpReadErrors += 1
+                        } else {
+                            self.diagnostics.icmpCanceledReads += 1
+                        }
+                    }
+                    try Self.throwError(result: result)
+                }
+                return result
+            },
+            cancel: { [weak self] in
+                self?.workQueue.async { [weak self] in
+                    guard let self,
+                          self.icmpSocket?.tunnelHandle == socket.tunnelHandle,
+                          self.icmpSocket?.socketHandle == socket.socketHandle else { return }
+                    self.closeICMP()
                 }
             }
-            try Self.throwError(result: result)
-        }
-
-        return result
+        )
     }
 
     public func sendICMPPing(seqNumber: UInt16) throws {

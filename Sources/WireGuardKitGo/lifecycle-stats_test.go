@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/net/icmp"
+	"golang.org/x/net/ipv4"
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun/netstack"
@@ -88,6 +90,56 @@ func TestClosedTunnelCannotAcquireNewSockets(t *testing.T) {
 	})
 	if id != errNoSuchTunnel || len(handle.socketHandles) != 0 {
 		t.Fatalf("socket resurrected after Close: %d", id)
+	}
+}
+
+// Replay a receiver paused just before entering C while cancellation and a new receiver run.
+// The old immutable identity must fail immediately without stealing the new session's response.
+func TestDelayedOldReceiverCannotConsumeReplacementReply(t *testing.T) {
+	handle := NewTunnelHandle(testBackend(t), nil, device.NewLogger(device.LogLevelSilent, ""), nil)
+	tunnelID := tunnels.Insert(&handle)
+	t.Cleanup(func() { wgTurnOff(tunnelID) })
+	addPipe := func() (int32, net.Conn) {
+		reader, writer := net.Pipe()
+		t.Cleanup(func() { writer.Close() })
+		id := handle.AddSocket(context.Background(), func(context.Context, *netstack.Net) (net.Conn, error) {
+			return reader, nil
+		})
+		return id, writer
+	}
+	oldID, _ := addPipe()
+	beginOldRead, oldResult := make(chan struct{}), make(chan int32, 1)
+	go func() {
+		<-beginOldRead
+		oldResult <- wgRecvInTunnelPing(tunnelID, oldID)
+	}()
+	handle.RemoveAndCloseSocket(oldID)
+	newID, newWriter := addPipe()
+	close(beginOldRead)
+	select {
+	case result := <-oldResult:
+		if result != errICMPOpenSocket {
+			t.Fatalf("stale receive result: %d", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stale receive acquired the replacement socket")
+	}
+	newResult := make(chan int32, 1)
+	go func() { newResult <- wgRecvInTunnelPing(tunnelID, newID) }()
+	packet, err := (&icmp.Message{Type: ipv4.ICMPTypeEchoReply, Body: &icmp.Echo{ID: 7, Seq: 17}}).Marshal(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newWriter.Write(packet); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case result := <-newResult:
+		if result != 17 {
+			t.Fatalf("replacement lost reply: %d", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("replacement receiver did not receive its reply")
 	}
 }
 
