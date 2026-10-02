@@ -26,10 +26,11 @@ extern int wgTurnOnMultihop(const char *exitSettings, const char *entrySettings,
 extern void wgTurnOff(int handle);
 extern int64_t wgSetConfig(int handle, const char *exitSettings, const char *entrySettings);
 extern char *wgGetConfig(int handle);
+extern int32_t wgGetTrafficStats(int32_t handle, uint64_t *bytesReceived, uint64_t *bytesSent);
 extern void wgBumpSockets(int handle);
 extern void wgDisableSomeRoamingForBrokenMobileSemantics(int handle);
 extern int wgOpenInTunnelICMP(int tunnelHandle, const char *address);
-extern int wgCloseInTunnelICMP(int tunnelHandle, int socketHandle);
+extern bool wgCloseInTunnelICMP(int32_t tunnelHandle, int32_t socketHandle);
 extern int32_t wgSendInTunnelPing(int32_t tunnelHandle, int32_t socketHandle, uint16_t pingId, int32_t pingSize, uint16_t sequenceNumber);
 extern int32_t wgRecvInTunnelPing(int32_t tunnelHandle, int32_t socketHandle);
 extern int32_t wgOpenInTunnelTCP(int32_t tunnelHandle, const char *address, uint64_t connectTimeout);

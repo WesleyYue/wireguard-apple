@@ -54,11 +54,55 @@ private enum State {
     case temporaryShutdown(_ settingsGenerator: PacketTunnelSettingsGenerator)
 }
 
+/// Exit-hop counters, read directly from the backend without serializing configuration.
+public struct WireGuardTrafficStats: Sendable {
+    public let bytesReceived: UInt64
+    public let bytesSent: UInt64
+}
+
+/// Cumulative counters for this adapter instance. Contains no keys, endpoints or addresses.
+public struct WireGuardAdapterDiagnostics: Sendable {
+    public fileprivate(set) var backendGeneration: UInt64 = 0
+    public fileprivate(set) var backendStarts: UInt64 = 0
+    public fileprivate(set) var backendStops: UInt64 = 0
+    public fileprivate(set) var icmpGeneration: UInt64?
+    public fileprivate(set) var icmpOpened: UInt64 = 0
+    public fileprivate(set) var icmpClosed: UInt64 = 0
+    public fileprivate(set) var icmpSendErrors: UInt64 = 0
+    public fileprivate(set) var icmpReadErrors: UInt64 = 0
+    public fileprivate(set) var icmpCanceledReads: UInt64 = 0
+    public fileprivate(set) var pathUpdates: UInt64 = 0
+    public fileprivate(set) var pathUnchanged: UInt64 = 0
+    public fileprivate(set) var pathRebinds: UInt64 = 0
+    public fileprivate(set) var statsReads: UInt64 = 0
+    public fileprivate(set) var statsErrors: UInt64 = 0
+}
+
+/// A socket belongs to exactly one backend generation, even if an integer handle is later reused.
+private struct ICMPSocket {
+    let tunnelHandle: Int32
+    let socketHandle: Int32
+    let generation: UInt64
+    let pingId: UInt16
+}
+
 public class WireGuardAdapter {
     public typealias LogHandler = (WireGuardLogLevel, String) -> Void
 
     /// Network routes monitor.
     private var networkMonitor: NWPathMonitor?
+
+    /// Latest path reported by `networkMonitor`.
+    private var monitorPath: Network.NWPath?
+
+    /// The path the WireGuard sockets were last bound on, or nil if not known yet.
+    private var boundPathSignature: PathSignature?
+
+    /// Pending re-check of the interface addresses after an ignored path update.
+    private var addressCheck: DispatchWorkItem?
+
+    /// Invalidates callbacks queued by canceled observers and monitors.
+    private var pathObservationGeneration: UInt64 = 0
 
     /// Packet tunnel provider.
     private weak var packetTunnelProvider: NEPacketTunnelProvider?
@@ -78,8 +122,10 @@ public class WireGuardAdapter {
     /// Adapter state.
     private var state: State = .stopped
 
-    /// ICMP socket handle, if open
-    private var icmpSocketHandle: Int32?
+    /// ICMP resource owned by the currently running backend.
+    private var icmpSocket: ICMPSocket?
+
+    private var diagnostics = WireGuardAdapterDiagnostics()
 
     /// Whether adapter should automatically raise the `reasserting` flag when updating
     /// tunnel configuration.
@@ -187,7 +233,7 @@ public class WireGuardAdapter {
         // Shutdown the tunnel
         if case .started(let handle, _) = self.state {
             wgTurnOff(handle)
-            self.icmpSocketHandle = nil
+            self.icmpSocket = nil
         }
     }
 
@@ -211,6 +257,29 @@ public class WireGuardAdapter {
         }
     }
 
+    /// Completion executes on the adapter queue, like `getRuntimeConfiguration`.
+    public func getTrafficStats(completionHandler: @escaping (WireGuardTrafficStats?) -> Void) {
+        workQueue.async {
+            guard case .started(let handle, _) = self.state else {
+                completionHandler(nil)
+                return
+            }
+            self.diagnostics.statsReads += 1
+            var received: UInt64 = 0
+            var sent: UInt64 = 0
+            guard wgGetTrafficStats(handle, &received, &sent) == 0 else {
+                self.diagnostics.statsErrors += 1
+                completionHandler(nil)
+                return
+            }
+            completionHandler(WireGuardTrafficStats(bytesReceived: received, bytesSent: sent))
+        }
+    }
+
+    public func getDiagnostics(completionHandler: @escaping (WireGuardAdapterDiagnostics) -> Void) {
+        workQueue.async { completionHandler(self.diagnostics) }
+    }
+
     public func startMultihop(exitConfiguration: TunnelConfiguration, entryConfiguration: TunnelConfiguration?, daita: DaitaConfiguration? = nil, completionHandler: @escaping (WireGuardAdapterError?) -> Void) {
         workQueue.async {
             guard case .stopped = self.state else {
@@ -230,22 +299,12 @@ public class WireGuardAdapter {
             do {
                 let settingsGenerator = try self.makeSettingsGenerator(with: exitConfiguration, entryConfiguration: entryConfiguration, daita: daita)
 
-                let (exitWgConfig, resolutionResults) = settingsGenerator.uapiConfiguration()
-                let entryWgConfig = settingsGenerator.entryUapiConfiguration()?.0
-                self.logEndpointResolutionResults(resolutionResults)
-
-                self.state = .started(
-                    try self.startWireGuardBackend(exitWgConfig: exitWgConfig, privateAddress: privateAddress, entryWgConfig: entryWgConfig, mtu: 1280, daita: daita),
-                    settingsGenerator
-                )
-
-                if let gateway = exitConfiguration.pingableGateway {
-                    try self.openICMP(address: gateway)
-                }
+                try self.activateBackend(settingsGenerator: settingsGenerator, privateAddress: privateAddress)
 
                 completionHandler(nil)
             } catch let error as WireGuardAdapterError {
                 self.removeDefaultPathObserver()
+                self.state = .stopped
                 completionHandler(error)
             } catch {
                 fatalError()
@@ -268,11 +327,10 @@ public class WireGuardAdapter {
         workQueue.async {
             switch self.state {
             case .started(let handle, _):
-                wgTurnOff(handle)
-                self.icmpSocketHandle = nil
+                self.shutdownBackend(handle)
 
             case .temporaryShutdown:
-                break
+                self.closeICMP()
 
             case .stopped:
                 completionHandler(.invalidState)
@@ -423,11 +481,46 @@ public class WireGuardAdapter {
         if handle < 0 {
             throw WireGuardAdapterError.startWireGuardBackend(handle)
         }
+        diagnostics.backendGeneration += 1
+        diagnostics.backendStarts += 1
         pingId = UInt16.random(in: UInt16.min...UInt16.max)
         #if os(iOS)
         wgDisableSomeRoamingForBrokenMobileSemantics(handle)
         #endif
         return handle
+    }
+
+    /// Startup and offline resume share one configuration path, including the entry hop and DAITA.
+    private func activateBackend(settingsGenerator: PacketTunnelSettingsGenerator, privateAddress: IPAddress) throws {
+        let (exitConfig, exitResolution) = settingsGenerator.uapiConfiguration()
+        let entry = settingsGenerator.entryUapiConfiguration()
+        logEndpointResolutionResults(exitResolution)
+        if let entry { logEndpointResolutionResults(entry.1) }
+        let handle = try startWireGuardBackend(
+            exitWgConfig: exitConfig, privateAddress: privateAddress,
+            entryWgConfig: entry?.0, daita: settingsGenerator.daita
+        )
+        state = .started(handle, settingsGenerator)
+        boundPathSignature = monitorPath.flatMap(PathSignature.init)
+        do {
+            if let gateway = settingsGenerator.exit.configuration.pingableGateway {
+                try openICMP(address: gateway)
+            }
+        } catch {
+            shutdownBackend(handle)
+            state = .temporaryShutdown(settingsGenerator)
+            throw error
+        }
+    }
+
+    /// Invalidates Swift resources before destroying their Go owner.
+    private func shutdownBackend(_ handle: Int32) {
+        closeICMP()
+        wgTurnOff(handle)
+        diagnostics.backendStops += 1
+        boundPathSignature = nil
+        addressCheck?.cancel()
+        addressCheck = nil
     }
 
     /// Resolves the hostnames in the given tunnel configuration and return settings generator.
@@ -473,35 +566,61 @@ public class WireGuardAdapter {
     private func addDefaultPathObserver() {
         guard let packetTunnelProvider = packetTunnelProvider else { return }
 
+        pathObservationGeneration += 1
+        let generation = pathObservationGeneration
         defaultPathObserver?.invalidate()
         defaultPathObserver = packetTunnelProvider.observe(\.defaultPath, options: [.new]) { [weak self] _, change in
             guard let self = self, let defaultPath = change.newValue?.flatMap({ $0 }) else { return }
 
             self.workQueue.async {
+                guard self.pathObservationGeneration == generation else { return }
                 self.didReceivePathUpdate(path: defaultPath)
             }
         }
 
         currentDefaultPath = packetTunnelProvider.defaultPath
+
+        // `NEProvider.defaultPath` doesn't expose the interface or gateways, so compare paths from a monitor instead.
+        // The handler runs on `workQueue`.
+        networkMonitor?.cancel()
+        monitorPath = nil
+        // Observe the physical route; the tunnel's utun route must not trigger its own socket rebind.
+        let monitor = NWPathMonitor(prohibitedInterfaceTypes: [.other, .loopback])
+        monitor.pathUpdateHandler = { [weak self] path in
+            guard let self = self, self.pathObservationGeneration == generation else { return }
+            self.diagnostics.pathUpdates += 1
+            self.monitorPath = path
+            self.rebindIfPathChanged(source: .monitor)
+        }
+        monitor.start(queue: workQueue)
+        networkMonitor = monitor
     }
 
     private func removeDefaultPathObserver() {
+        pathObservationGeneration += 1
         defaultPathObserver?.invalidate()
         defaultPathObserver = nil
         currentDefaultPath = nil
+
+        networkMonitor?.cancel()
+        networkMonitor = nil
+        monitorPath = nil
+        boundPathSignature = nil
+        addressCheck?.cancel()
+        addressCheck = nil
     }
 
     /// Method invoked by KVO observer when new network path is received.
     /// - Parameter path: new network path
     private func didReceivePathUpdate(path: NetworkExtension.NWPath) {
+        diagnostics.pathUpdates += 1
         let isSamePath = currentDefaultPath?.isEqual(to: path) ?? false
 
         currentDefaultPath = path
 
-        self.logHandler(.verbose, "Network change detected with \(path.status)")
-
         #if os(macOS)
         if case .started(let handle, _) = self.state, !isSamePath {
+            diagnostics.pathRebinds += 1
             wgBumpSockets(handle)
         }
         #elseif os(iOS)
@@ -510,20 +629,17 @@ public class WireGuardAdapter {
         switch self.state {
         case .started(let handle, let settingsGenerator):
             if isSatisfiable {
-                guard !isSamePath else { return }
+                guard !isSamePath else {
+                    self.diagnostics.pathUnchanged += 1
+                    return
+                }
 
-                let (wgConfig, resolutionResults) = settingsGenerator.endpointUapiConfiguration()
-                self.logEndpointResolutionResults(resolutionResults)
-
-                wgSetConfig(handle, wgConfig, nil)
-                wgDisableSomeRoamingForBrokenMobileSemantics(handle)
-                wgBumpSockets(handle)
+                self.rebindIfPathChanged(source: .defaultPath)
             } else {
                 self.logHandler(.verbose, "Connectivity offline, pausing backend.")
 
+                self.shutdownBackend(handle)
                 self.state = .temporaryShutdown(settingsGenerator)
-                self.closeICMP()
-                wgTurnOff(handle)
             }
 
         case .temporaryShutdown(let settingsGenerator):
@@ -539,17 +655,7 @@ public class WireGuardAdapter {
 
 
             do {
-                let (exitWgConfig, resolutionResults) = settingsGenerator.uapiConfiguration()
-                self.logEndpointResolutionResults(resolutionResults)
-
-                self.state = .started(
-                    try self.startWireGuardBackend(exitWgConfig: exitWgConfig, privateAddress: privateAddress, daita: settingsGenerator.daita),
-                    settingsGenerator
-                )
-
-                if let gatewayAddress = settingsGenerator.exit.configuration.pingableGateway {
-                    try self.openICMP(address: gatewayAddress)
-                }
+                try self.activateBackend(settingsGenerator: settingsGenerator, privateAddress: privateAddress)
             } catch {
                 self.logHandler(.error, "Failed to restart backend: \(error.localizedDescription)")
             }
@@ -562,15 +668,143 @@ public class WireGuardAdapter {
         #error("Unsupported")
         #endif
     }
+
+    /// Rebinds the WireGuard sockets if the preferred interface, its gateways or its addresses changed since they
+    /// were last bound. `NEProvider.defaultPath` can report a new path every few seconds while none of these change,
+    /// and each rebind wakes the radio and sends keepalives.
+    private func rebindIfPathChanged(source: PathUpdateSource) {
+        dispatchPrecondition(condition: .onQueue(workQueue))
+        #if os(iOS)
+        guard case .started(let handle, let settingsGenerator) = self.state else { return }
+
+        // Without a monitor path to compare against, rebind as before.
+        if let monitorPath = self.monitorPath {
+            // Loss of connectivity is handled by the `defaultPath` observer.
+            guard let signature = PathSignature(monitorPath) else { return }
+
+            if signature == self.boundPathSignature {
+                self.diagnostics.pathUnchanged += 1
+                if source != .addressCheck {
+                    self.scheduleAddressCheck()
+                }
+                return
+            }
+
+        }
+
+        let (wgConfig, resolutionResults) = settingsGenerator.endpointUapiConfiguration()
+        let entry = settingsGenerator.entryEndpointUapiConfiguration()
+        self.logEndpointResolutionResults(resolutionResults)
+        if let entry { self.logEndpointResolutionResults(entry.1) }
+
+        guard wgSetConfig(handle, wgConfig, entry?.0) == 0 else {
+            self.logHandler(.error, "Failed to update endpoint configuration for path change.")
+            return
+        }
+        // Unknown startup paths require one real bind, since the first monitor callback may describe a newer path.
+        self.boundPathSignature = self.monitorPath.flatMap(PathSignature.init)
+        wgDisableSomeRoamingForBrokenMobileSemantics(handle)
+        self.diagnostics.pathRebinds += 1
+        wgBumpSockets(handle)
+        #endif
+    }
+
+    /// Compares the addresses again a few seconds after an ignored path update, since an address can change without
+    /// the path changing. Does nothing while a check is pending, so frequent updates can't postpone it.
+    private func scheduleAddressCheck() {
+        guard addressCheck == nil else { return }
+
+        let generation = pathObservationGeneration
+        let check = DispatchWorkItem { [weak self] in
+            guard let self = self, self.pathObservationGeneration == generation else { return }
+            self.addressCheck = nil
+            self.rebindIfPathChanged(source: .addressCheck)
+        }
+        addressCheck = check
+        workQueue.asyncAfter(deadline: .now() + .seconds(3), execute: check)
+    }
+}
+
+private enum PathUpdateSource {
+    /// `NEProvider.defaultPath` changed.
+    case defaultPath
+
+    /// `NWPathMonitor` reported a path.
+    case monitor
+
+    /// Delayed comparison of the interface addresses.
+    case addressCheck
+}
+
+/// The parts of a satisfied path that matter to the WireGuard sockets: the interface the system prefers, the network
+/// it's attached to, and its addresses. Adapted from `GotaTunPathObserver` in mullvadvpn-app (57f39174, 0d697bb3).
+private struct PathSignature: Equatable {
+    let interface: String
+    let gateways: Set<Network.NWEndpoint>
+    let addresses: Set<String>
+
+    init?(_ path: Network.NWPath) {
+        guard path.status == .satisfied,
+              let interface = path.availableInterfaces.first(where: {
+                  [.wifi, .cellular, .wiredEthernet].contains($0.type) && !$0.name.hasPrefix("utun")
+              })?.name else { return nil }
+        self.interface = interface
+        self.gateways = Set(path.gateways)
+        self.addresses = interfaceAddresses(of: interface)
+    }
+}
+
+/// The IPv4 and IPv6 addresses assigned to `interface`.
+private func interfaceAddresses(of interface: String) -> Set<String> {
+    var list: UnsafeMutablePointer<ifaddrs>?
+    guard getifaddrs(&list) == 0, let first = list else { return [] }
+    defer { freeifaddrs(list) }
+
+    var addresses = Set<String>()
+    for entry in sequence(first: first, next: { $0.pointee.ifa_next }) {
+        guard String(cString: entry.pointee.ifa_name) == interface,
+              let address = entry.pointee.ifa_addr,
+              [AF_INET, AF_INET6].contains(Int32(address.pointee.sa_family))
+        else { continue }
+
+        var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+        guard getnameinfo(address, socklen_t(address.pointee.sa_len), &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST) == 0
+        else { continue }
+        addresses.insert(host.withUnsafeBufferPointer { String(cString: $0.baseAddress!) })
+    }
+    return addresses
 }
 
 // A protocol encompassing the stateful ICMP ping capabilities of the WireGuardAdapter, decoupling them from its implementation
 public protocol ICMPPingProvider {
     func sendICMPPing(seqNumber: UInt16) throws
     func receiveICMP() throws -> Int32
+
+    /// Closes the socket to end an outstanding receive. The next ping operation reopens it.
+    func cancelICMPReceive()
 }
 
 extension WireGuardAdapter: ICMPPingProvider {
+    public func cancelICMPReceive() {
+        workQueue.async { self.closeICMP() }
+    }
+
+    /// Serialized acquisition includes ping identity and generation, so restart cannot mix their owners.
+    private func acquireICMPSocket() throws -> ICMPSocket {
+        dispatchPrecondition(condition: .onQueue(workQueue))
+        guard case .started(let handle, let settingsGenerator) = state else {
+            throw WireGuardAdapterError.icmpSocketNotOpen
+        }
+        if icmpSocket == nil, let gateway = settingsGenerator.exit.configuration.pingableGateway {
+            try openICMP(address: gateway)
+        }
+        guard let socket = icmpSocket, socket.tunnelHandle == handle,
+              socket.generation == diagnostics.backendGeneration else {
+            throw WireGuardAdapterError.icmpSocketNotOpen
+        }
+        return socket
+    }
+
     /// MARK: ICMP Ping functionality
     private func openICMP(address: IPv4Address) throws {
         dispatchPrecondition(condition: .onQueue(workQueue))
@@ -579,7 +813,7 @@ extension WireGuardAdapter: ICMPPingProvider {
         }
 
         // Ignore multiple calls to `openICMP`
-        guard icmpSocketHandle == nil else { return }
+        guard icmpSocket == nil else { return }
 
         // assumption: the description of an IPv4Address will always produce valid ASCII
         let addrString = "\(address)"
@@ -592,29 +826,39 @@ extension WireGuardAdapter: ICMPPingProvider {
                 default: throw WireGuardAdapterError.internalError(socket)
             }
         }
-        self.icmpSocketHandle = socket
+        self.icmpSocket = ICMPSocket(
+            tunnelHandle: tunnelHandle, socketHandle: socket,
+            generation: diagnostics.backendGeneration, pingId: pingId
+        )
+        diagnostics.icmpOpened += 1
+        diagnostics.icmpGeneration = diagnostics.icmpOpened
     }
 
     public func closeICMP() {
         dispatchPrecondition(condition: .onQueue(workQueue))
-        if let icmpSocketHandle, case let .started(tunnelHandle, _) = state {
-            wgCloseInTunnelICMP(tunnelHandle, icmpSocketHandle)
-            self.icmpSocketHandle = nil
-        }
+        guard let socket = icmpSocket else { return }
+        // Forget the resource unconditionally, including while temporarily shut down.
+        icmpSocket = nil
+        diagnostics.icmpGeneration = nil
+        wgCloseInTunnelICMP(socket.tunnelHandle, socket.socketHandle)
+        diagnostics.icmpClosed += 1
     }
 
     // Returns the sequence number of the ICMP message that was received.
     // This could be improved by also returning the ID of the message that was received.
     public func receiveICMP() throws -> Int32 {
         dispatchPrecondition(condition: .notOnQueue(workQueue))
-        let tunnelSocketPair = try workQueue.sync {
-            guard case .started(let tunnelHandle, _) = self.state, let icmpSocketHandle else {
-                throw WireGuardAdapterError.icmpSocketNotOpen
-            }
-            return (tunnelHandle: tunnelHandle, socketHandle: icmpSocketHandle)
-        }
-        let result = wgRecvInTunnelPing(tunnelSocketPair.tunnelHandle, tunnelSocketPair.socketHandle)
+        let socket = try workQueue.sync { try self.acquireICMPSocket() }
+        let result = wgRecvInTunnelPing(socket.tunnelHandle, socket.socketHandle)
         if result < 0 {
+            workQueue.async {
+                if self.icmpSocket?.generation == socket.generation,
+                   self.icmpSocket?.socketHandle == socket.socketHandle {
+                    self.diagnostics.icmpReadErrors += 1
+                } else {
+                    self.diagnostics.icmpCanceledReads += 1
+                }
+            }
             try Self.throwError(result: result)
         }
 
@@ -623,14 +867,12 @@ extension WireGuardAdapter: ICMPPingProvider {
 
     public func sendICMPPing(seqNumber: UInt16) throws {
         dispatchPrecondition(condition: .notOnQueue(workQueue))
-        let tunnelSocketPair = try workQueue.sync {
-            guard case .started(let tunnelHandle, _) = self.state, let icmpSocketHandle else {
-                throw WireGuardAdapterError.icmpSocketNotOpen
-            }
-            return (tunnelHandle: tunnelHandle, socketHandle: icmpSocketHandle)
+        let socket = try workQueue.sync { try self.acquireICMPSocket() }
+        let seq = wgSendInTunnelPing(socket.tunnelHandle, socket.socketHandle, socket.pingId, 16, seqNumber)
+        if seq < 0 {
+            workQueue.async { self.diagnostics.icmpSendErrors += 1 }
+            try Self.throwError(result: seq)
         }
-        let seq = wgSendInTunnelPing(tunnelSocketPair.tunnelHandle, tunnelSocketPair.socketHandle, pingId, 16, seqNumber)
-        if seq < 0 { try Self.throwError(result: seq) }
     }
 
     private static func throwError(result: Int32) throws {

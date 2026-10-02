@@ -75,6 +75,8 @@ const (
 	errTCPNoSocket = -21
 	errTCPWrite    = -22
 	errTCPRead     = -23
+	// Invalid output pointers supplied to a narrow statistics accessor.
+	errInvalidStatsOutput = -24
 )
 
 var loggerFunc unsafe.Pointer
@@ -322,12 +324,34 @@ func wgTurnOff(tunnelHandle int32) {
 }
 
 //export wgSetConfig
-func wgSetConfig(tunnelHandle int32, settings *C.char) int64 {
+func wgSetConfig(tunnelHandle int32, settings *C.char, entrySettings *C.char) int64 {
 	handle := tunnels.Get(tunnelHandle)
 	if handle == nil {
 		return errNoSuchTunnel
 	}
-	return handle.SetConfig(C.GoString(settings))
+	return handle.SetConfig(C.GoString(settings), C.GoString(entrySettings))
+}
+
+// wgGetTrafficStats returns exit-device counters, preserving the monitor's
+// single-hop/multihop meaning without allocating a full UAPI configuration.
+// Output pointers are untouched on failure.
+//
+//export wgGetTrafficStats
+func wgGetTrafficStats(tunnelHandle int32, bytesReceived *C.uint64_t, bytesSent *C.uint64_t) int32 {
+	if bytesReceived == nil || bytesSent == nil {
+		return errInvalidStatsOutput
+	}
+	handle := tunnels.Get(tunnelHandle)
+	if handle == nil {
+		return errNoSuchTunnel
+	}
+	stats := handle.exit.TrafficStats()
+	if stats.PeerCount == 0 {
+		return errNoPeer
+	}
+	*bytesReceived = C.uint64_t(stats.BytesReceived)
+	*bytesSent = C.uint64_t(stats.BytesSent)
+	return 0
 }
 
 //export wgGetConfig

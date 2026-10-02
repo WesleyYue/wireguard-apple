@@ -4,6 +4,7 @@ import "C"
 
 import (
 	"context"
+	"math"
 	"net"
 	"sync"
 	"time"
@@ -15,6 +16,9 @@ import (
 type tunnelHandles struct {
 	handles map[int32]*tunnelHandle
 	lock    sync.Mutex
+	// Never reuse a tunnel identity: callers can still be returning from a
+	// blocking receive after the backend that owned their handle was removed.
+	nextHandle int64
 }
 
 func NewTunnelHandles() *tunnelHandles {
@@ -36,7 +40,13 @@ func (h *tunnelHandles) Insert(handle *tunnelHandle) int32 {
 	h.lock.Lock()
 	defer h.lock.Unlock()
 
-	return insertHandle(h.handles, handle)
+	if h.nextHandle >= math.MaxInt32 {
+		return errDeviceLimitHit
+	}
+	index := int32(h.nextHandle)
+	h.nextHandle++
+	h.handles[index] = handle
+	return index
 }
 
 // Removes the handle at `idx` and returns it. Returns nil if `idx` doesn't exist.
@@ -50,17 +60,21 @@ func (h *tunnelHandles) Remove(idx int32) *tunnelHandle {
 
 type tunnelHandle struct {
 	// A WireGuard device for the exit relay.
-	exit          *device.Device
+	exit *device.Device
 	// A WireGuard device for the entry relay.
-	entry         *device.Device
+	entry *device.Device
 	// A logger.
-	logger        *device.Logger
+	logger *device.Logger
 	// A virtual network used to send traffic to the exit relay.
-	VirtualNet    *netstack.Net
+	VirtualNet *netstack.Net
 	// Socket handles that are attached to the virtual network.
 	socketHandles map[int32]*socketHandle
+	// Socket identities are never reused within one tunnel lifetime either.
+	nextSocketHandle int64
+	// Prevents a C call that captured this owner before removal from resurrecting sockets after Close.
+	closed bool
 	// A lock to be held when mutating this struct.
-	lock          *sync.Mutex
+	lock *sync.Mutex
 }
 
 func NewTunnelHandle(exit *device.Device, entry *device.Device, logger *device.Logger, virtualNet *netstack.Net) tunnelHandle {
@@ -83,7 +97,10 @@ func (tun *tunnelHandle) GetConfig() *string {
 	return &settings
 }
 
-func (tun *tunnelHandle) SetConfig(settings string) int64 {
+func (tun *tunnelHandle) SetConfig(settings, entrySettings string) int64 {
+	if entrySettings != "" && tun.entry == nil {
+		return errBadEntryConfig
+	}
 	err := tun.exit.IpcSet(settings)
 	if err != nil {
 		tun.logger.Errorf("Unable to set IPC settings: %v", err)
@@ -91,6 +108,15 @@ func (tun *tunnelHandle) SetConfig(settings string) int64 {
 			return ipcErr.ErrorCode()
 		}
 		return errBadWgConfig
+	}
+	if entrySettings != "" {
+		if err := tun.entry.IpcSet(entrySettings); err != nil {
+			tun.logger.Errorf("Unable to set entry IPC settings: %v", err)
+			if ipcErr, ok := err.(*device.IPCError); ok {
+				return ipcErr.ErrorCode()
+			}
+			return errBadWgConfig
+		}
 	}
 	return 0
 }
@@ -130,14 +156,16 @@ func (tun *tunnelHandle) AddSocket(ctx context.Context, createSocket func(ctx co
 	tun.lock.Lock()
 	defer tun.lock.Unlock()
 
-	socketHandle := newSocketHandle(tun.VirtualNet, ctx, createSocket)
-	handle := insertHandle(tun.socketHandles, socketHandle)
-	// Whilst technically we could try getting an unused key into the map
-	// before creating a handle, it is far too unlikely that we will run out of
-	// int32 handles that the incurred mess of that is not worth it.
-	if handle < 0 {
-		socketHandle.close()
+	if tun.closed {
+		return errNoSuchTunnel
 	}
+	if tun.nextSocketHandle >= math.MaxInt32 {
+		return errDeviceLimitHit
+	}
+	socketHandle := newSocketHandle(tun.VirtualNet, ctx, createSocket)
+	handle := int32(tun.nextSocketHandle)
+	tun.nextSocketHandle++
+	tun.socketHandles[handle] = socketHandle
 	return handle
 }
 
@@ -172,7 +200,10 @@ func (tun *tunnelHandle) Close() {
 	tun.lock.Lock()
 	defer tun.lock.Unlock()
 
-
+	if tun.closed {
+		return
+	}
+	tun.closed = true
 	for _, socket := range tun.socketHandles {
 		socket.close()
 	}
@@ -192,13 +223,13 @@ type socketHandle struct {
 	// whilst it is trying to create a TCP connection to our relay.
 	initializingLock *sync.Mutex
 	// Underlying connection
-	conn             net.Conn
+	conn net.Conn
 	// Error returned when connection fails to initialize
-	connError        error
+	connError error
 
 	// Cancel function is returned by `context.WithCancel`. This should cancel
 	// any initialization of a socket.
-	cancelFunc       func()
+	cancelFunc func()
 }
 
 // Creates a new socket handle for a connection and spawns off a goroutine initializing the connection.
@@ -228,8 +259,8 @@ func newSocketHandle(vnet *netstack.Net, ctx context.Context, createSocket func(
 
 func (handle *socketHandle) close() {
 	handle.cancelFunc()
-	handle.initializingLock.Lock() 
-	defer handle.initializingLock.Unlock() 
+	handle.initializingLock.Lock()
+	defer handle.initializingLock.Unlock()
 	if handle.conn != nil {
 		handle.conn.Close()
 	}

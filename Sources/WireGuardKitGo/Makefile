@@ -38,6 +38,7 @@ build: $(DESTDIR)/libwg-go.a
 version-header: $(DESTDIR)/wireguard-go-version.h
 
 REAL_GOROOT := $(shell go env GOROOT 2>/dev/null)
+GO_SOURCES := $(shell rg --files -g '*.go' .)
 export GOROOT := $(BUILDDIR)/goroot
 $(GOROOT)/.prepared:
 	[ -n "$(REAL_GOROOT)" ]
@@ -52,7 +53,7 @@ $(BUILDDIR)/libwg-go-$(1).a: export CGO_CFLAGS := $(CFLAGS_PREFIX) $(ARCH)
 $(BUILDDIR)/libwg-go-$(1).a: export CGO_LDFLAGS := $(CFLAGS_PREFIX) $(ARCH)
 $(BUILDDIR)/libwg-go-$(1).a: export GOOS := $(GOOS_$(PLATFORM_NAME))
 $(BUILDDIR)/libwg-go-$(1).a: export GOARCH := $(GOARCH_$(1))
-$(BUILDDIR)/libwg-go-$(1).a: $(GOROOT)/.prepared go.mod
+$(BUILDDIR)/libwg-go-$(1).a: $(GOROOT)/.prepared go.mod go.sum $(GO_SOURCES)
 	git submodule update --init --recursive
 	CARGO_TARGET_DIR="$(BUILDDIR)/target" \
 			DESTINATION="$(BUILT_PRODUCTS_DIR)" \
