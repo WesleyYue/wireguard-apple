@@ -22,6 +22,25 @@ private func snapshot(_ monitor: NWPathMonitor) -> Network.NWPath {
 }
 
 print("Reading the physical interface through the current VPN route...")
+let gatewayA = Network.NWEndpoint.hostPort(host: "192.0.2.1", port: .any)
+let gatewayC = Network.NWEndpoint.hostPort(host: "192.0.2.2", port: .any)
+private let knownA = PathSignature(interface: "en0", gateways: [gatewayA], addresses: ["192.0.2.10"])
+private let unknown = PathSignature(interface: "en0", gateways: nil, addresses: knownA.addresses)
+private let knownC = PathSignature(interface: "en0", gateways: [gatewayC], addresses: knownA.addresses)
+private func rebindCount(_ observations: [PathSignature], startingWith baseline: PathSignature) -> Int {
+    var bound = baseline
+    var count = 0
+    for observation in observations {
+        if observation.hasMeaningfulDifference(from: bound) { count += 1; bound = observation }
+        else { bound = observation.mergingMetadata(from: bound) }
+    }
+    return count
+}
+precondition(rebindCount([unknown, knownA], startingWith: knownA) == 0, "Hidden gateway metadata caused a rebind")
+precondition(rebindCount([unknown, knownC], startingWith: knownA) == 1, "Changed gateway did not cause exactly one rebind")
+precondition(rebindCount([knownA], startingWith: unknown) == 0, "Learning gateway metadata caused a rebind")
+precondition(knownA != unknown && unknown != knownC && knownA != knownC, "Structural equality treated unknown as a wildcard")
+print("PASS: known_unknown_same=0_rebinds known_unknown_changed=1_rebind structural_equality_preserved=true")
 let firstPath = snapshot(NWPathMonitor())
 guard let first = PathSignature(firstPath) else {
     fatalError("The current satisfied VPN path did not produce a physical interface signature")

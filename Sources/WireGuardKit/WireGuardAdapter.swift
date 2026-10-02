@@ -685,7 +685,10 @@ public class WireGuardAdapter: @unchecked Sendable {
             // Loss of connectivity is handled by the `defaultPath` observer.
             guard let signature = PathSignature(monitorPath) else { return }
 
-            if signature == self.boundPathSignature {
+            if let previous = self.boundPathSignature, !signature.hasMeaningfulDifference(from: previous) {
+                // A VPN route can temporarily hide gateway metadata. Keep the known physical gateway so its
+                // disappearance and reappearance do not become two socket rebinds.
+                self.boundPathSignature = signature.mergingMetadata(from: previous)
                 self.diagnostics.pathUnchanged += 1
                 if source != .addressCheck {
                     self.scheduleAddressCheck()
@@ -743,17 +746,38 @@ private enum PathUpdateSource {
 /// it's attached to, and its addresses. Adapted from `GotaTunPathObserver` in mullvadvpn-app (57f39174, 0d697bb3).
 private struct PathSignature: Equatable {
     let interface: String
-    let gateways: Set<Network.NWEndpoint>
+    let gateways: Set<Network.NWEndpoint>?
     let addresses: Set<String>
+
+    init(interface: String, gateways: Set<Network.NWEndpoint>?, addresses: Set<String>) {
+        self.interface = interface
+        self.gateways = gateways
+        self.addresses = addresses
+    }
 
     init?(_ path: Network.NWPath) {
         guard path.status == .satisfied,
               let interface = path.availableInterfaces.first(where: {
                   [.wifi, .cellular, .wiredEthernet].contains($0.type) && !$0.name.hasPrefix("utun")
               })?.name else { return nil }
-        self.interface = interface
-        self.gateways = Set(path.gateways)
-        self.addresses = interfaceAddresses(of: interface)
+        self.init(
+            interface: interface,
+            gateways: path.gateways.isEmpty ? nil : Set(path.gateways),
+            addresses: interfaceAddresses(of: interface)
+        )
+    }
+
+    /// Compare observations directionally. Missing gateway metadata is unknown, rather than a new network.
+    /// Structural Equatable remains transitive; it is not used as a wildcard for unknown metadata.
+    func hasMeaningfulDifference(from previous: PathSignature) -> Bool {
+        guard interface == previous.interface, addresses == previous.addresses else { return true }
+        guard let gateways, let previousGateways = previous.gateways else { return false }
+        return gateways != previousGateways
+    }
+
+    func mergingMetadata(from previous: PathSignature) -> PathSignature {
+        guard interface == previous.interface, addresses == previous.addresses else { return self }
+        return PathSignature(interface: interface, gateways: gateways ?? previous.gateways, addresses: addresses)
     }
 }
 
